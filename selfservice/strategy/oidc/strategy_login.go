@@ -19,6 +19,7 @@ import (
 
 	"github.com/ory/kratos/ui/node"
 	"github.com/ory/x/sqlcon"
+	"github.com/ory/x/fetcher"
 
 	"github.com/ory/kratos/selfservice/flow/registration"
 
@@ -34,6 +35,8 @@ import (
 	"github.com/ory/kratos/selfservice/flow"
 	"github.com/ory/kratos/selfservice/flow/login"
 	"github.com/ory/kratos/x"
+
+	"github.com/tidwall/gjson"
 )
 
 var _ login.Strategy = new(Strategy)
@@ -171,6 +174,21 @@ func (s *Strategy) processLogin(w http.ResponseWriter, r *http.Request, loginFlo
 		httprouter.ParamsFromContext(r.Context()).ByName("organization"))
 	for _, c := range oidcCredentials.Providers {
 		if c.Subject == claims.Subject && c.Provider == provider.Config().ID {
+			fetch := fetcher.NewFetcher(fetcher.WithClient(s.d.HTTPClient(r.Context())))
+			jn, err := fetch.FetchContext(r.Context(), provider.Config().Mapper)
+			if err != nil {
+				return nil, s.handleError(w, r, loginFlow, provider.Config().ID, nil, err)
+			}
+
+			evaluated, err := vm.EvaluateAnonymousSnippet(provider.Config().Mapper, jn.String())
+			if err != nil {
+				return nil, s.handleError(w, r, loginFlow, provider.Config().ID, nil, err)
+			}
+
+			if err := s.setLoginTraits(w, r, loginFlow, provider, container, evaluated, i); err != nil {
+				return nil, s.handleError(w, r, loginFlow, provider.Config().ID, i.Traits, err)
+			}
+
 			if err = s.d.LoginHookExecutor().PostLoginHook(w, r, node.OpenIDConnectGroup, loginFlow, i, sess, provider.Config().ID); err != nil {
 				return nil, s.handleError(w, r, loginFlow, provider.Config().ID, nil, err)
 			}
@@ -284,4 +302,30 @@ func (s *Strategy) Login(w http.ResponseWriter, r *http.Request, f *login.Flow, 
 	}
 
 	return nil, errors.WithStack(flow.ErrCompletedByStrategy)
+}
+
+func (s *Strategy) setLoginTraits(w http.ResponseWriter, r *http.Request, a *login.Flow, provider Provider, container *AuthCodeContainer, evaluated string, i *identity.Identity) error {
+	jsonTraits := gjson.Get(evaluated, "identity.traits")
+	if !jsonTraits.IsObject() {
+		return errors.WithStack(herodot.ErrInternalServerError.WithReasonf("OpenID Connect Jsonnet mapper did not return an object for key identity.traits. Please check your Jsonnet code!"))
+	}
+
+	if container != nil {
+		traits, err := merge(container.Traits, json.RawMessage(jsonTraits.Raw))
+		if err != nil {
+			return s.handleError(w, r, a, provider.Config().ID, nil, err)
+		}
+
+		i.Traits = traits
+	} else {
+		i.Traits = identity.Traits(json.RawMessage(jsonTraits.Raw))
+	}
+	s.d.Logger().
+		WithRequest(r).
+		WithField("oidc_provider", provider.Config().ID).
+		WithSensitiveField("identity_traits", i.Traits).
+		WithSensitiveField("mapper_jsonnet_output", evaluated).
+		WithField("mapper_jsonnet_url", provider.Config().Mapper).
+		Debug("Merged form values and OpenID Connect Jsonnet output.")
+	return nil
 }
